@@ -1,0 +1,7 @@
+httpx
+matplotlib
+fastapi
+uvicorn
+pydantic
+pytest
+# vLLM is installed inside the Colab notebook, not here

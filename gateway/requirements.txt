@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+httpx
+pydantic
+# optional, only used if LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are set:
+# langfuse

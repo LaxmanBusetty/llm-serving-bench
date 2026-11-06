@@ -1,123 +1,208 @@
-# LLM Serving Benchmark: vLLM vs Ollama, speed vs quality
+# LLM Serving Benchmark
 
-A small, reproducible project that serves an open-source LLM (Qwen3) under different configurations, load tests each one, and measures whether the speed-ups cost any answer quality. The workload is receipt extraction (the same kind of task as my LedgerMate project), scored against known gold labels.
+A reproducible benchmark for self-hosted LLM inference. It serves an open-source model (Qwen3) under different configurations with vLLM and Ollama, load tests each one, and scores output quality against known answers, so speed gains can be weighed against any loss in accuracy.
 
-> **Status: fill in the results section after you run it.** Nothing below the "Results" heading is a claim until you replace the placeholders with your own numbers.
+The benchmark workload is structured data extraction from receipt text, scored field by field against gold labels. The tools work with any OpenAI-compatible server.
 
-## Questions this project answers
+## Contents
 
-1. How do throughput and latency change as concurrent requests go from 1 to 16?
-2. What does 4-bit quantization (AWQ) save in memory and gain in speed, and does extraction accuracy change?
-3. Does prefix caching reduce time to first token when every request shares a long system prompt?
-4. How does a laptop (Ollama on a Mac) compare with a cloud GPU (vLLM on Colab)?
-5. What does it take to wrap a model server in a service with health checks, rate limiting, timeouts and metrics?
+- [What it measures](#what-it-measures)
+- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [Methodology](#methodology)
+- [Results](#results)
+- [Serving gateway](#serving-gateway)
+- [Testing](#testing)
+- [Limitations](#limitations)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
-## What is in the repo
+## What it measures
+
+| Area | Metrics |
+|---|---|
+| Latency | Time to first token (TTFT) and end-to-end latency, p50 and p95 |
+| Throughput | Aggregate output tokens per second and requests per second at 1 to N concurrent requests |
+| Decode speed | Per-request tokens per second after the first token |
+| Reliability | Request error count and first error message per concurrency level |
+| Startup | Cold-start time from process launch to the first successful request |
+| Quality | JSON validity rate, per-field accuracy, exact-match rate with a bootstrap 95% confidence interval |
+
+Configurations that can be compared include numeric precision (fp16 vs 4-bit AWQ), prefix caching on or off, model size, and server (vLLM vs Ollama).
+
+## Architecture
 
 ```
-src/synth.py          seeded synthetic receipts with gold labels, shared system prompt
-src/loadtest.py       async streaming load test (TTFT, latency, tokens/sec, throughput, errors)
-src/quality_eval.py   field-level accuracy, JSON validity, bootstrap 95% CI
-src/summarize.py      markdown tables and charts from results/*.json
-gateway/app.py        FastAPI gateway: /health, /v1/chat, /metrics, rate limit, timeouts, optional Langfuse
-gateway/Dockerfile    container for the gateway
-notebooks/            Colab notebook that runs the whole experiment on a GPU
-tests/                10 pytest tests using a mock OpenAI-compatible server (no GPU needed)
+            synthetic receipts (seeded, gold labels)
+                         |
+          +--------------+---------------+
+          |                              |
+   src/loadtest.py               src/quality_eval.py
+   (streaming, concurrent)       (JSON parse + field scoring)
+          |                              |
+          +--------------+---------------+
+                         |
+              OpenAI-compatible API
+        (vLLM, Ollama, SGLang, or the gateway)
+                         |
+                  results/*.json
+                         |
+                src/summarize.py
+            results/summary.md + charts
 ```
 
-## How to run
+## Repository layout
 
-**1. Tests (any machine, no GPU)**
+```
+src/
+  synth.py            Seeded synthetic receipts with gold labels; shared system prompt
+  loadtest.py         Async streaming load test
+  quality_eval.py     Field-level accuracy and confidence intervals
+  summarize.py        Markdown tables and charts from results/
+gateway/
+  app.py              FastAPI gateway in front of a model server
+  Dockerfile
+  requirements.txt
+notebooks/
+  serving_benchmark_colab.ipynb   End-to-end experiment on a Colab GPU
+tests/                Automated tests using a mock OpenAI-compatible server
+data/eval_set.jsonl   The default 100-record evaluation set (seed 7)
+docs/background.md    Concepts behind the metrics
+results/              Output directory (generated)
+```
+
+## Quick start
+
+Requirements: Python 3.10 or later. A GPU is needed only for the vLLM experiments.
+
 ```bash
+git clone https://github.com/LaxmanBusetty/llm-serving-bench.git
+cd llm-serving-bench
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python -m pytest -q tests
 ```
 
-**2. GPU experiment (Colab)**
-Open `notebooks/serving_benchmark_colab.ipynb`, choose a GPU runtime, run the cells top to bottom. It starts vLLM for each configuration in the `CONFIGS` list, load tests it, scores quality, and saves everything to `results/` and Google Drive.
+The test suite runs on any machine without a GPU or a model.
 
-**3. Laptop baseline (Mac, Ollama)**
+## Usage
+
+### 1. GPU experiment (Google Colab)
+
+Open `notebooks/serving_benchmark_colab.ipynb` in Colab with a GPU runtime. The notebook installs vLLM, then for each entry in its `CONFIGS` list it:
+
+1. starts the vLLM server and records cold-start time,
+2. runs the load test,
+3. runs the quality evaluation,
+4. stops the server and copies results to Google Drive.
+
+Edit `CONFIGS` to change models and server flags. Each result file stores the GPU model, model name and server arguments.
+
+### 2. Local baseline (Ollama)
+
 ```bash
 ollama pull qwen3:4b
 OLLAMA_NUM_PARALLEL=8 ollama serve
-python src/loadtest.py   --base-url http://localhost:11434 --model qwen3:4b --label ollama_qwen3-4b_mac
-python src/quality_eval.py --base-url http://localhost:11434 --model qwen3:4b --label ollama_qwen3-4b_mac
-```
-The same scripts work for any OpenAI-compatible server (vLLM, Ollama, SGLang, the gateway), which is what makes the numbers comparable.
 
-**4. Summary tables and charts**
+python src/loadtest.py     --base-url http://localhost:11434 --model qwen3:4b --label ollama_qwen3-4b
+python src/quality_eval.py --base-url http://localhost:11434 --model qwen3:4b --label ollama_qwen3-4b
+```
+
+### 3. Against any OpenAI-compatible server
+
+```bash
+python src/loadtest.py --base-url http://HOST:PORT --model MODEL_NAME --label my_config \
+    --levels 1,4,8,16 --requests-per-level 32 --max-tokens 160
+```
+
+Key options:
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--levels` | `1,4,8,16` | Concurrency levels to test |
+| `--requests-per-level` | `32` | Requests sent at each level |
+| `--max-tokens` | `160` | Output token limit |
+| `--warmup` | `4` | Warm-up requests, excluded from results |
+| `--extra-body` | none | JSON merged into the request body |
+| `--think` | off | Keep Qwen3 reasoning mode on (off by default via `/no_think`) |
+
+### 4. Summarize
+
 ```bash
 python src/summarize.py
 ```
 
-**5. Gateway (optional)**
-```bash
-UPSTREAM_URL=http://localhost:8000 MODEL=Qwen/Qwen3-4B uvicorn gateway.app:app --port 9000
-curl localhost:9000/health
-curl localhost:9000/metrics
-```
-Docker: `docker build -f gateway/Dockerfile -t llm-gateway .`
+Writes `results/summary.md`, `throughput_vs_concurrency.png`, `p95_latency_vs_concurrency.png` and, when quality files exist, `quality_vs_speed.png`.
 
-To trace requests with Langfuse, `pip install langfuse` and set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` (and `LANGFUSE_HOST` if self-hosting). Check `/metrics` for `"langfuse_enabled": true` and confirm traces appear in the Langfuse dashboard before you describe it as done.
+## Methodology
 
-## Method
-
-- **Workload:** 100 synthetic receipts (seed 7) for quality; a separate seeded set for load testing. Every request carries the same ~350-token system prompt (schema, rules, one example), then a different receipt. Temperature 0.
-- **Load test:** closed loop. At concurrency N, N workers keep sending until the request budget is used. A short warm-up run is done first and discarded. Streaming is used so time to first token is measured directly. Output tokens come from the server's usage report when available.
-- **Quality:** model output is parsed as JSON (think-blocks and code fences removed). Each of six fields is compared to the gold value (vendor case-insensitive, date exact ISO, numbers within one cent, item count exact, payment method exact). Exact match means all six fields right. A bootstrap 95% confidence interval is reported so small gaps are not over-read.
-- **Controls:** one variable changes per configuration, and the GPU model, vLLM version and flags are saved with each result.
+- **Workload.** Seeded synthetic receipts, so every run uses identical inputs. Each request carries the same system prompt of roughly 350 tokens (schema, rules and one example) followed by a different receipt. Temperature is 0.
+- **Load generation.** Closed loop: at concurrency N, N workers send requests back to back until the request budget is used. A warm-up run is discarded. Responses are streamed so TTFT is measured directly. Output token counts come from the server's usage report when available, otherwise from counting streamed chunks; the result file records which was used.
+- **Quality scoring.** The model reply is parsed as JSON after removing reasoning blocks and code fences. Six fields are compared with the gold values: vendor (case-insensitive), date (exact ISO), item count (exact), tax and total (within one cent), and payment method (exact). Exact match requires all six. A bootstrap 95% confidence interval (2,000 resamples) accompanies the exact-match rate.
+- **Reproducibility.** Seeds are fixed, and each result file stores the hardware description, model name, label, and timestamp. The vLLM version and server flags are saved in `startup_<label>.json`.
 
 ## Results
 
-Fill this in from `results/summary.md`. Keep the GPU and versions next to the numbers.
+Each run writes its figures to `results/`; see `results/summary.md` and the charts for the numbers from your hardware. Results depend on the GPU, driver, serving-engine version and model, so compare configurations only within the same environment. To share results, include the GPU model and vLLM version alongside the table.
 
-- GPU: `____`   vLLM version: `____`   Date run: `____`
+## Serving gateway
 
-| Config | Cold start (s) | Peak throughput (tok/s) | TTFT p50 @ 1 (s) | p95 latency @ 16 (s) | Exact match (95% CI) |
-|---|---|---|---|---|---|
-| ollama qwen3-4b (Mac) | | | | | |
-| vllm qwen3-4b fp16, prefix on | | | | | |
-| vllm qwen3-4b fp16, prefix off | | | | | |
-| vllm qwen3-4b AWQ | | | | | |
-| vllm qwen3-8b AWQ | | | | | |
+`gateway/app.py` is a FastAPI service that sits in front of a model server and adds production basics:
 
-Charts: `results/throughput_vs_concurrency.png`, `results/p95_latency_vs_concurrency.png`, `results/quality_vs_speed.png`.
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Returns 200 only if the upstream model server responds |
+| `POST /v1/chat` | Forwards a chat request with a timeout; returns text, token count and latency |
+| `GET /metrics` | Request, error and rate-limit counts; p50 and p95 latency |
 
-### Findings (write these after you have numbers)
-- Batching: throughput went from `__` to `__` tok/s going from 1 to 16 concurrent requests, while p95 latency went from `__` to `__` s.
-- Quantization: AWQ changed exact match from `__` to `__` (CIs `__` and `__`), so the difference is / is not distinguishable from noise.
-- Prefix caching: TTFT p50 changed from `__` to `__` s.
-- Laptop vs GPU: `__`.
+Behavior: per-client sliding-window rate limiting (HTTP 429), upstream timeout (504), upstream error (502), and structured JSON request logs.
 
-### Limitations (keep these, edit to match what you actually did)
-- One GPU type, one synthetic workload, 100 evaluation examples.
-- Synthetic receipts are cleaner than real ones. Results show relative differences between configurations, not real-world accuracy.
-- This is a benchmark, not a production deployment serving users.
+```bash
+UPSTREAM_URL=http://localhost:8000 MODEL=Qwen/Qwen3-4B uvicorn gateway.app:app --port 9000
+```
 
-## Resume bullets (use only after you have real numbers)
+| Variable | Default | Meaning |
+|---|---|---|
+| `UPSTREAM_URL` | `http://localhost:8000` | Model server base URL |
+| `MODEL` | empty | Model name sent upstream |
+| `RATE_LIMIT_PER_MIN` | `60` | Requests per client per minute |
+| `TIMEOUT_S` | `60` | Upstream timeout in seconds |
 
-- Benchmarked vLLM and Ollama serving of Qwen3 across `N` configurations (fp16 vs AWQ 4-bit, prefix caching on/off); measured throughput, time to first token and p95 latency at 1 to 16 concurrent requests, reaching `X` tok/s on a `GPU`.
-- Evaluated quality impact of quantization on a receipt-extraction task with gold labels (`n` examples, bootstrap CIs); AWQ changed exact-match accuracy by `X` points (`within / outside` noise) while reducing memory by `Y`%.
-- Built a FastAPI gateway with upstream health checks, rate limiting, timeouts and latency metrics, covered by 10 automated tests.
+Optional Langfuse tracing is enabled when `langfuse` is installed and `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set. `/metrics` reports `langfuse_enabled`. Container build:
 
-## Concepts to be ready to explain
+```bash
+docker build -f gateway/Dockerfile -t llm-gateway .
+```
 
-- **Continuous batching:** new requests join a running batch at every decoding step instead of waiting for the batch to finish, which is why throughput rises with concurrency.
-- **KV cache and PagedAttention:** the key/value cache grows with sequence length and usually limits how many requests fit in memory. PagedAttention stores it in blocks to avoid wasted space.
-- **Prefill vs decode:** prefill processes the prompt in parallel (drives TTFT); decode generates one token at a time (drives tokens/sec).
-- **Quantization trade-off:** 4-bit weights use about a quarter of the memory of fp16 and can speed up decoding, with a possible accuracy cost. That is why this project measures it.
-- **Prefix caching:** reuses the KV cache of a shared prompt prefix, cutting prefill work for requests that begin with the same text.
-- **Latency vs throughput:** pushing concurrency up raises total tokens/sec but makes each request slower. The right setting depends on the service-level target.
+## Testing
+
+```bash
+python -m pytest -q tests
+```
+
+The suite (10 tests) covers dataset determinism and label consistency, JSON extraction, field scoring, bootstrap intervals, percentile math, the load tester and evaluator against a local mock streaming server, error handling when the server is unreachable, and the gateway's health, rate limiting, error mapping and metrics. A mock OpenAI-compatible server (`tests/mock_server.py`) stands in for the model, so no GPU is required.
+
+## Limitations
+
+- The workload is synthetic and cleaner than real receipts. Quality figures reflect relative differences between configurations, not real-world accuracy.
+- Evaluation uses 100 examples by default; use the confidence intervals before concluding that two configurations differ.
+- Results are specific to the tested GPU, driver and engine versions.
+- The gateway is a reference implementation for measuring and learning. It has no authentication, persistence or multi-instance coordination.
+- This repository benchmarks serving behavior. It is not a production inference deployment.
 
 ## Troubleshooting
 
-- **Out of memory when the server starts:** lower `--max-model-len`, `--max-num-seqs` or `--gpu-memory-utilization`, or pick a smaller or quantized model. Look at `results/server_<label>.log`.
-- **Server will not start on a T4:** T4 has no bfloat16 and lacks some newer kernels. Keep `--dtype half`. If your vLLM version does not support your GPU, try an L4 or A100 runtime, or install an earlier vLLM release and record the version.
-- **Model name not found:** check the exact repo name on Hugging Face and edit `CONFIGS`.
-- **Colab disconnects:** results are copied to Drive after each configuration. Rerun and skip finished configs by removing them from the list.
-- **Ollama shows no speed-up with concurrency:** set `OLLAMA_NUM_PARALLEL` before starting the server.
-- **Token counts look odd:** the load test uses the server's usage report when present and falls back to counting streamed chunks (the result file records which one was used).
+| Symptom | Likely cause and fix |
+|---|---|
+| Out of memory at server start | Lower `--max-model-len`, `--max-num-seqs` or `--gpu-memory-utilization`, or use a smaller or quantized model. See `results/server_<label>.log`. |
+| Server fails on a T4 GPU | The T4 lacks bfloat16 and some newer kernels. Keep `--dtype half`. If your vLLM version does not support the GPU, use an L4 or A100 runtime or an earlier vLLM release. |
+| Model not found | Verify the exact repository name on Hugging Face and update `CONFIGS`. |
+| No speed-up with concurrency on Ollama | Set `OLLAMA_NUM_PARALLEL` before starting `ollama serve`. |
+| `externally-managed-environment` on macOS | Use a virtual environment as shown in Quick start. |
 
-## Tested and not tested
+## License
 
-The load tester, evaluator, summary tools and gateway are covered by automated tests and a full dry run against a mock server. The vLLM, Ollama and GPU parts were not run when this was written, so the first real run may need small adjustments (model names, flags for your vLLM version).
+MIT. See [LICENSE](LICENSE).
